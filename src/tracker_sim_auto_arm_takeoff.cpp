@@ -15,6 +15,7 @@
 #include <mavros_msgs/State.h>
 #include <mavros_msgs/CommandBool.h>
 #include <mavros_msgs/SetMode.h>
+#include "geometry_msgs/PointStamped.h"
 
 #define GRAVITATIONAL_ACC 9.81
 
@@ -44,12 +45,14 @@ double planned_yaw;
 Vector3d current_p;
 Vector3d current_v;
 Quaterniond current_att;
-ros::Publisher att_ctrl_pub, odom_sp_enu_pub;
+ros::Publisher att_ctrl_pub, odom_sp_enu_pub, tracking_error_pub;
 double thrust_factor; //, thrust_factor_max, thrust_factor_min;
 //double max_flight_time, max_stand_by_time;
 double flight_time_second = 0.0, stand_by_time_second = 0.0;
 bool pva_topic_received = false;
 bool pose_updated = false;
+bool watch_dog_flag = false;
+
 
 Vector3d vectorElementMultiply(Vector3d v1, Vector3d v2)
 {
@@ -89,6 +92,20 @@ void pvaCallback(const trajectory_msgs::JointTrajectoryPoint::ConstPtr& msg)
     planned_yaw = msg->positions[3];
     planned_v << msg->velocities[0], msg->velocities[1], msg->velocities[2];
     planned_a << msg->accelerations[0], msg->accelerations[1], msg->accelerations[2];
+
+    
+    /// Calculate tracking error
+    static Vector3d planned_p_last = planned_p;
+    Vector3d tracking_position_error = planned_p_last - current_p;
+
+    geometry_msgs::PointStamped tracking_error_message;
+    tracking_error_message.header.stamp = ros::Time::now();
+    tracking_error_message.point.x = tracking_position_error.x();
+    tracking_error_message.point.y = tracking_position_error.y();
+    tracking_error_message.point.z = tracking_position_error.z();
+    tracking_error_pub.publish(tracking_error_message);
+
+    planned_p_last = planned_p;
 
 
     /// Publish to record in rosbag
@@ -148,14 +165,14 @@ void pvaCallback(const trajectory_msgs::JointTrajectoryPoint::ConstPtr& msg)
     Vector3d z_w_norm(0, 0, 1.0);
 
     Vector3d a_des_no_gravity = a_fb + planned_a;
-     /// Set a limit. Important 
+    /// Set a limit. Important
     if(a_des_no_gravity.norm() > MAX_A){  // MAX ACC: 5
         a_des_no_gravity /= (a_des_no_gravity.norm() / MAX_A);
     }
 
     Vector3d a_des = a_des_no_gravity + GRAVITATIONAL_ACC * z_w_norm;
 
-   
+
 
     /// End
 
@@ -177,13 +194,13 @@ void pvaCallback(const trajectory_msgs::JointTrajectoryPoint::ConstPtr& msg)
 
     Eigen::Vector3d body_x, body_y, body_z;
     if (expected_thrust.norm() > 0.00001f) {
-                body_z = expected_thrust / expected_thrust.norm();  //Normalize
-        } else {
-                // no thrust, set Z axis to safe value
-                body_z << 0.f, 0.f, 1.f;
-        }
+        body_z = expected_thrust / expected_thrust.norm();  //Normalize
+    } else {
+        // no thrust, set Z axis to safe value
+        body_z << 0.f, 0.f, 1.f;
+    }
 
-        // vector of desired yaw direction in XY plane rotated by PI/2
+    // vector of desired yaw direction in XY plane rotated by PI/2
     Eigen::Vector3d y_C(-sin(expected_yaw), cos(expected_yaw), 0.0f); // ???? chg
 
     if (fabs(body_z(2)) > 0.000001) {
@@ -192,16 +209,16 @@ void pvaCallback(const trajectory_msgs::JointTrajectoryPoint::ConstPtr& msg)
 
         // keep nose to front while inverted upside down
         if (body_z(2) < 0.0f) {
-                body_x = -body_x;
+            body_x = -body_x;
         }
 
         body_x = body_x;
 
     } else {
-            // desired thrust is in XY plane, set X downside to construct correct matrix,
-            // but yaw component will not be used actually
-            body_x = Eigen::Vector3d::Zero();
-            body_x(2) = 1.0f;
+        // desired thrust is in XY plane, set X downside to construct correct matrix,
+        // but yaw component will not be used actually
+        body_x = Eigen::Vector3d::Zero();
+        body_x(2) = 1.0f;
     }
 
     body_y = body_z.cross(body_x);
@@ -230,9 +247,11 @@ void pvaCallback(const trajectory_msgs::JointTrajectoryPoint::ConstPtr& msg)
     att_setpoint.thrust = thrust_des;
 
     ROS_INFO_THROTTLE(1.0, "Attitude Quaternion Setpoint is w=%f, x=%f, y=%f, z=%f, thrust=%f", att_setpoint.orientation.w,
-            att_setpoint.orientation.x, att_setpoint.orientation.y, att_setpoint.orientation.z, att_setpoint.thrust);
+                      att_setpoint.orientation.x, att_setpoint.orientation.y, att_setpoint.orientation.z, att_setpoint.thrust);
 
     att_ctrl_pub.publish(att_setpoint);
+
+    watch_dog_flag = false;
 }
 
 
@@ -257,7 +276,7 @@ void positionCallback(const geometry_msgs::PoseStamped::ConstPtr &msg)
             stand_by_time_second += ros::Time::now().toSec() - last_time;
         }
         last_time = ros::Time::now().toSec();
-        // double coeff_stand_by_time_to_flight_time = max_flight_time / max_stand_by_time; 
+        // double coeff_stand_by_time_to_flight_time = max_flight_time / max_stand_by_time;
         // thrust_factor = thrust_factor_min + (thrust_factor_max-thrust_factor_min)*(flight_time_second / 60.0 + stand_by_time_second / 60.0*coeff_stand_by_time_to_flight_time) / max_flight_time;
         // if(thrust_factor > thrust_factor_max) thrust_factor = thrust_factor_max;
     }
@@ -291,6 +310,18 @@ void configureCallback(tracker::PVA_TrackerConfig &config, uint32_t level) {
 }
 
 
+void watchDogCallback(const ros::TimerEvent& e)
+{
+    if(pva_topic_received){
+        if(watch_dog_flag){  // No command received in 1 second
+            pva_topic_received = false;
+        }
+        watch_dog_flag = true;
+    }
+
+}
+
+
 
 int main(int argc, char** argv) {
     ros::init(argc, argv, "tracker");
@@ -307,10 +338,17 @@ int main(int argc, char** argv) {
     ros::Subscriber pva_sub = nh.subscribe("/pva_setpoint", 1, pvaCallback);
     att_ctrl_pub = nh.advertise<mavros_msgs::AttitudeTarget>("/mavros/setpoint_raw/attitude", 1);
     odom_sp_enu_pub = nh.advertise<nav_msgs::Odometry>("/odom_sp_enu", 1);
+    tracking_error_pub = nh.advertise<geometry_msgs::PointStamped>("/pva_tracking_error", 1);
+
+    ros::Timer timer1 = nh.createTimer(ros::Duration(0.2), watchDogCallback); // RATE 5 Hz to publish
 
 
     ros::Publisher pose_sp_pub = nh.advertise<geometry_msgs::PoseStamped>("/mavros/setpoint_position/local", 1);
     geometry_msgs::PoseStamped take_off_position;
+    //take_off_position.pose.position.x = -2;
+    //take_off_position.pose.position.y = -6;
+    //take_off_position.pose.position.z = 1.2;
+
     take_off_position.pose.position.x = 0;
     take_off_position.pose.position.y = 0;
     take_off_position.pose.position.z = 1.2;
@@ -343,8 +381,6 @@ int main(int argc, char** argv) {
     }
 
     ROS_INFO("Position received. Vehicle will get into offboard mode and arm soon.");
-    take_off_position.pose.position.x = current_p(0);
-    take_off_position.pose.position.y = current_p(1);
 
     while(ros::ok()){
         if( current_state.mode != "OFFBOARD" &&
@@ -375,7 +411,49 @@ int main(int argc, char** argv) {
         loop_rate.sleep();
     }
 
+    Vector3d current_p_recorded = current_p;
+    geometry_msgs::PoseStamped position_setpoint;
 
-    ros::spin();
+    while(ros::ok()){
+        if(!pva_topic_received){
+            // Add height
+            while (current_p(2) < 9.0 && ros::ok()){
+                position_setpoint.pose.position.x = current_p_recorded.x();
+                position_setpoint.pose.position.y = current_p_recorded.y();
+                position_setpoint.pose.position.z = 10.5;
+                pose_sp_pub.publish(position_setpoint);
+                ros::spinOnce();
+                loop_rate.sleep();
+            }
+
+            // Go to the top of the origin
+            while ((fabs(current_p(0) - take_off_position.pose.position.x) > 1.0
+                    || fabs(current_p(1) - take_off_position.pose.position.y) > 1.0) && ros::ok()){
+                position_setpoint.pose.position.x = take_off_position.pose.position.x;
+                position_setpoint.pose.position.y = take_off_position.pose.position.y;
+                position_setpoint.pose.position.z = 10.5;
+                pose_sp_pub.publish(position_setpoint);
+                ros::spinOnce();
+                loop_rate.sleep();
+            }
+
+            // Go to the take off position
+            while ((fabs(current_p(2) - take_off_position.pose.position.z) > 1.0
+                    || !pva_topic_received ) && ros::ok()){
+                pose_sp_pub.publish(take_off_position);
+                ros::spinOnce();
+                loop_rate.sleep();
+            }
+
+        }else{
+            current_p_recorded = current_p;
+        }
+
+        ros::spinOnce();
+        loop_rate.sleep();
+    }
+
+
+//    ros::spin();
     return 0;
 }
