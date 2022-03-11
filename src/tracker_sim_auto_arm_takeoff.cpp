@@ -6,6 +6,7 @@
 #include <trajectory_msgs/JointTrajectoryPoint.h>
 #include <Eigen/Eigen>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/PointStamped.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <mavros_msgs/AttitudeTarget.h>
 #include <mavros_msgs/CompanionProcessStatus.h>
@@ -48,7 +49,7 @@ double planned_yaw;
 Vector3d current_p;
 Vector3d current_v;
 Quaterniond current_att;
-ros::Publisher att_ctrl_pub, odom_sp_enu_pub, system_status_pub;
+ros::Publisher att_ctrl_pub, odom_sp_enu_pub, system_status_pub, tracking_error_pub;
 double thrust_factor; //, thrust_factor_max, thrust_factor_min;
 //double max_flight_time, max_stand_by_time;
 double flight_time_second = 0.0, stand_by_time_second = 0.0;
@@ -109,6 +110,14 @@ void posCmdCallback(const quadrotor_msgs::PositionCommand &msg) {
     /// Calculate desired thrust and attitude
     Vector3d p_error = planned_p - current_p;
     Vector3d delt_p_error = p_error - p_error_last;
+
+    /* publish tracking error */
+    geometry_msgs::PointStamped tracking_error;
+    tracking_error.header.stamp = ros::Time::now();
+    tracking_error.point.x = p_error.x();
+    tracking_error.point.y = p_error.y();
+    tracking_error.point.z = p_error.z();
+    tracking_error_pub.publish(tracking_error);
 
     planned_v += vectorElementMultiply(p_error, position_error_p) + vectorElementMultiply(delt_p_error, position_error_d) + vectorElementMultiply(p_error_accumulate, position_error_i);
     Vector3d v_error = planned_v - current_v;
@@ -252,6 +261,14 @@ void pvaCallback(const trajectory_msgs::JointTrajectoryPoint::ConstPtr& msg)
     /// Calculate desired thrust and attitude
     Vector3d p_error = planned_p - current_p;
     Vector3d delt_p_error = p_error - p_error_last;
+
+    /* publish tracking error */
+    // geometry_msgs::PointStamped tracking_error;
+    // tracking_error.header.stamp = ros::Time::now();
+    // tracking_error.point.x = p_error.x();
+    // tracking_error.point.y = p_error.y();
+    // tracking_error.point.z = p_error.z();
+    // tracking_error_pub.publish(tracking_error);
 
     planned_v += vectorElementMultiply(p_error, position_error_p) + vectorElementMultiply(delt_p_error, position_error_d) + vectorElementMultiply(p_error_accumulate, position_error_i);
     Vector3d v_error = planned_v - current_v;
@@ -451,6 +468,7 @@ int main(int argc, char** argv) {
     odom_sp_enu_pub = nh.advertise<nav_msgs::Odometry>("/odom_sp_enu", 1);
     system_status_pub = nh.advertise<mavros_msgs::CompanionProcessStatus>("mavros/companion_process/status", 1);
 
+    tracking_error_pub = nh.advertise<geometry_msgs::PointStamped>("/pva_tracking_error", 1);
 
     ros::Publisher pose_sp_pub = nh.advertise<geometry_msgs::PoseStamped>("mavros/setpoint_position/local", 10);
     geometry_msgs::PoseStamped take_off_position;
